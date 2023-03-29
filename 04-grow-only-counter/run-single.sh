@@ -1,0 +1,1 @@
+../maelstrom/maelstrom test -w g-counter --bin ~/go/bin/bin/maelstrom-grow-only-counter --node-count 1 --time-limit 20 --rate 10

@@ -27,7 +27,10 @@ The third part of this challenge involves making this system tolerant to network
 
 RPCs can be sent through the `SyncRPC()` method, so to avoid blocking, we can also set up a pool of worker goroutines to accept messages to send off of a channel. The `SyncRPC()` method also allows us to supply a `context.WithTimeout()`, which I've set to 100ms.
 
-> **Note**: It seems like my implementation is still a little susceptible to dropped messages due to the network partition.
->
-
 For [3d](https://fly.io/dist-sys/3d/), I introduced a batching method to periodically sync with neighbor nodes, and for [3e](https://fly.io/dist-sys/3e/) **(still in progress)**, I added some jitter to the timer for each node to prevent all of the messages getting sent at the same time. My best case was a medium stable latency of 1.668 seconds, which is still really high.
+
+## Grow-only Counter
+
+My first attempt was to use an append-only log, tracking inserted deltas with unique IDs in batches for each neighbor node. Once things were synched, we could calculate the total by traversing the log and summing up each delta once per UUID. This appeared to work, but I switched it to try using the Maelstrom KV store recommended in the challenge description.
+
+> Note: Investigate state-based conflict-free replicated data types.

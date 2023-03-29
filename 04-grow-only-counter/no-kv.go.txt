@@ -1,0 +1,228 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+	"math/rand"
+	"sync"
+	"time"
+
+	uuid "github.com/google/uuid"
+	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
+)
+
+type AddMessage struct {
+	Type  string `json:"type"`
+	Delta int64  `json:"delta"`
+}
+
+type SyncMessage struct {
+	Type   string      `json:"type"`
+	Events []*AddEvent `json:"events"`
+}
+
+type SyncMessagePayload struct {
+	Message SyncMessage
+	Dest    string
+	wg      *sync.WaitGroup
+}
+
+type AddEvent struct {
+	Uuid  string `json:"uuid"`
+	Delta int64  `json:"delta"`
+}
+
+type Service struct {
+	node          *maelstrom.Node
+	appendOnlyLog []*AddEvent
+	logMutex      sync.RWMutex
+	saved         map[string]struct{}
+	batchEvents   [][]*AddEvent
+	batchMutex    []sync.Mutex
+	ch            chan SyncMessagePayload
+}
+
+func (s *Service) getTotal() int64 {
+	total := int64(0)
+	used := make(map[string]struct{}, 0)
+	s.logMutex.RLock()
+	defer s.logMutex.RUnlock()
+	if len(s.appendOnlyLog) == 0 {
+		return 0
+	}
+	for i := len(s.appendOnlyLog) - 1; i >= 0; i -= 1 {
+		_, ok := used[s.appendOnlyLog[i].Uuid]
+		if !ok {
+			total += s.appendOnlyLog[i].Delta
+			used[s.appendOnlyLog[i].Uuid] = struct{}{}
+		}
+	}
+	return total
+}
+
+func (s *Service) logAmount(id string, delta int64) {
+	s.logMutex.RLock()
+	_, ok := s.saved[id]
+	s.logMutex.RUnlock()
+	if !ok {
+		s.logMutex.Lock()
+		s.saved[id] = struct{}{}
+		event := new(AddEvent)
+		event.Uuid = id
+		event.Delta = delta
+		s.appendOnlyLog = append(s.appendOnlyLog, event)
+		s.logMutex.Unlock()
+		for i, mut := range s.batchMutex {
+			mut.Lock()
+			s.batchEvents[i] = append(s.batchEvents[i], event)
+			mut.Unlock()
+		}
+	}
+}
+
+func (s *Service) runSync(i int, nodeId string) {
+	s.batchMutex[i].Lock()
+	defer s.batchMutex[i].Unlock()
+
+	if len(s.batchEvents[i]) == 0 {
+		return
+	}
+
+	msg := SyncMessage{
+		Type:   "sync",
+		Events: s.batchEvents[i],
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	s.ch <- SyncMessagePayload{
+		Dest:    nodeId,
+		Message: msg,
+		wg:      &wg,
+	}
+	wg.Wait()
+
+	s.batchEvents[i] = make([]*AddEvent, 0)
+}
+
+func main() {
+	n := maelstrom.NewNode()
+	poolChannel := createRPCPool(n, 10)
+
+	defaultNodeIds := len(n.NodeIDs())
+	if defaultNodeIds < 3 {
+		defaultNodeIds = 3
+	}
+
+	batchEvents := make([][]*AddEvent, defaultNodeIds)
+	batchMutex := make([]sync.Mutex, defaultNodeIds)
+	for i := 0; i < defaultNodeIds; i += 1 {
+		batchEvents[i] = make([]*AddEvent, 0)
+		batchMutex[i] = sync.Mutex{}
+	}
+
+	s := Service{
+		node:          n,
+		ch:            poolChannel,
+		saved:         make(map[string]struct{}, 0),
+		appendOnlyLog: make([]*AddEvent, 0),
+		batchEvents:   batchEvents,
+		batchMutex:    batchMutex,
+	}
+
+	n.Handle("add", func(msg maelstrom.Message) error {
+		var body AddMessage
+		if err := json.Unmarshal(msg.Body, &body); err != nil {
+			return err
+		}
+
+		// Update the message type to return back.
+		response := map[string]any{
+			"type": "add_ok",
+		}
+
+		s.logAmount(uuid.NewString(), body.Delta)
+
+		return n.Reply(msg, response)
+	})
+
+	n.Handle("sync", func(msg maelstrom.Message) error {
+		var body SyncMessage
+		if err := json.Unmarshal(msg.Body, &body); err != nil {
+			return err
+		}
+
+		// Update the message type to return back.
+		response := map[string]any{
+			"type": "sync_ok",
+		}
+
+		// Sync with others
+		for _, event := range body.Events {
+			s.logAmount(event.Uuid, event.Delta)
+		}
+
+		return n.Reply(msg, response)
+	})
+
+	n.Handle("read", func(msg maelstrom.Message) error {
+		var body map[string]any
+		if err := json.Unmarshal(msg.Body, &body); err != nil {
+			return err
+		}
+
+		// Update the message type to return back.
+		response := map[string]any{
+			"type":  "read_ok",
+			"value": s.getTotal(),
+		}
+
+		return n.Reply(msg, response)
+	})
+
+	ticker := time.NewTicker(time.Duration(rand.Intn(500)+250) * time.Millisecond)
+	quit := make(chan struct{})
+
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				for i, nodeId := range n.NodeIDs() {
+					if nodeId != n.ID() {
+						go s.runSync(i, nodeId)
+					}
+				}
+			case <-quit:
+				return
+			}
+		}
+	}()
+
+	if err := n.Run(); err != nil {
+		log.Fatal(err)
+		quit <- struct{}{}
+	}
+}
+
+func createRPCPool(n *maelstrom.Node, poolSize int) chan SyncMessagePayload {
+	ch := make(chan SyncMessagePayload)
+
+	for i := 0; i < poolSize; i += 1 {
+		go func() {
+			for {
+				msg := <-ch
+				for {
+					ctx, _ := context.WithTimeout(context.Background(), time.Millisecond*500)
+					_, err := n.SyncRPC(ctx, msg.Dest, msg.Message)
+					if err == nil {
+						msg.wg.Done()
+						break
+					}
+				}
+			}
+		}()
+	}
+
+	return ch
+}
