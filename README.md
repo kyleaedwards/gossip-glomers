@@ -21,7 +21,7 @@ A UUID library may satisfy this requirement, however if IDs need to be serial, t
 
 The first two parts ([3a](https://fly.io/dist-sys/3a/) and [3b](https://fly.io/dist-sys/3b/)) of this challenge establish a network of broadcast nodes by implementing a crude gossip protocol. Each node informs its neighbors of new incoming message IDs. If a node receives word of a message it's already received, it ignores it.
 
-> Gossiping is a common way to propagate information across a cluster when you don't need strong consistency guarantees.
+> **Note**: Gossiping is a common way to propagate information across a cluster when you don't need strong consistency guarantees.
 
 The third part of this challenge involves making this system tolerant to network partitions by gracefully handling timeouts and failed broadcasts. My gut instinct is to switch from `Send`ing a broadcast to neighbors to using an RPC instead with a timeout context. On failure or timeout, we should queue up an action to retry this after a slight delay with some pseudo-random jitter to prevent piling up outgoing requests.
 
@@ -31,6 +31,10 @@ For [3d](https://fly.io/dist-sys/3d/), I introduced a batching method to periodi
 
 ## Grow-only Counter
 
-My first attempt was to use an append-only log, tracking inserted deltas with unique IDs in batches for each neighbor node. Once things were synched, we could calculate the total by traversing the log and summing up each delta once per UUID. This appeared to work, but I switched it to try using the Maelstrom KV store recommended in the challenge description.
+My first attempt was to use an append-only log, tracking inserted deltas with unique IDs in batches for each neighbor node. Once things were synched, we could calculate the total by traversing the log and summing up each delta once per UUID. This appeared to work, but I switched it to try using the Maelstrom KV store recommended in the challenge description. By using the `KV.CompareAndSwap()` method and retrying on failure, it eventually reached consistency.
 
-> Note: Investigate state-based conflict-free replicated data types.
+> **TODO**: Investigate state-based conflict-free replicated data types as an alternative.
+
+## Kafka-style Log
+
+*In progress...*
